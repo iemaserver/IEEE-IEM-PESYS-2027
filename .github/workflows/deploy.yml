@@ -1,0 +1,67 @@
+
+name: Deploy Next.js
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Setup Node.js and npm
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install PM2 if Missing
+        run: |
+          if ! command -v pm2 >/dev/null 2>&1; then
+            echo "Installing PM2..."
+            npm install -g pm2
+          else
+            echo "PM2 is already installed"
+          fi
+
+      - name: Stop Existing Application
+        run: pm2 delete next-app || true
+
+      - name: Clean Deployment Directory
+        run: |
+          sudo rm -rf /var/www/my-nextjs-app
+          sudo mkdir -p /var/www/my-nextjs-app
+          sudo chown "$USER":"$(id -gn)" /var/www/my-nextjs-app
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Copy Application
+        run: |
+          cp -a "$GITHUB_WORKSPACE/." /var/www/my-nextjs-app/
+
+      - name: Install Dependencies
+        working-directory: /var/www/my-nextjs-app
+        run: npm ci
+
+      - name: Build Next.js
+        working-directory: /var/www/my-nextjs-app
+        run: npm run build
+
+      - name: Start Next.js Application
+        working-directory: /var/www/my-nextjs-app
+        run: |
+          pm2 start npm --name next-app -- start -- -p 3000
+          pm2 save
+
+      - name: Deployment Status
+        run: |
+          pm2 status
+          node --version
+          npm --version
+          pm2 --version
