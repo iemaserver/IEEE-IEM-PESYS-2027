@@ -14,12 +14,18 @@ jobs:
   deploy:
     runs-on: self-hosted
 
+    env:
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
+      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+
     steps:
+      # 1. Setup Node.js
       - name: Setup Node.js and npm
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
+      # 2. Install PM2 if missing
       - name: Install PM2 if Missing
         run: |
           if ! command -v pm2 >/dev/null 2>&1; then
@@ -29,36 +35,45 @@ jobs:
             echo "PM2 is already installed"
           fi
 
+      # 3. Stop existing application
       - name: Stop Existing Application
-        run: pm2 delete next-app || true
+        run: |
+          pm2 delete next-app || true
 
+      # 4. Clean deployment directory
       - name: Clean Deployment Directory
         run: |
           sudo rm -rf /var/www/my-nextjs-app
           sudo mkdir -p /var/www/my-nextjs-app
           sudo chown "$USER":"$(id -gn)" /var/www/my-nextjs-app
 
+      # 5. Checkout repository
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # 6. Copy application files
       - name: Copy Application
         run: |
           cp -a "$GITHUB_WORKSPACE/." /var/www/my-nextjs-app/
 
+      # 7. Install dependencies
       - name: Install Dependencies
         working-directory: /var/www/my-nextjs-app
         run: npm ci
 
+      # 8. Build Next.js application
       - name: Build Next.js
         working-directory: /var/www/my-nextjs-app
         run: npm run build
 
+      # 9. Start application using PM2
       - name: Start Next.js Application
         working-directory: /var/www/my-nextjs-app
         run: |
           pm2 start npm --name next-app -- start -- -p 3000
           pm2 save
 
+      # 10. Deployment status
       - name: Deployment Status
         run: |
           pm2 status
