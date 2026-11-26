@@ -1,4 +1,3 @@
-
 name: Deploy Next.js Application
 
 on:
@@ -25,64 +24,75 @@ jobs:
       APP_DIR: /var/www/my-nextjs-app
       APP_NAME: next-app
       PORT: 3000
+      REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
 
     steps:
 
-      # 1. Checkout repository
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      # 2. Setup Node.js
+      # 1. Setup Node.js on the runner
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: npm
 
-      # 3. Setup deployment environment
+      # 2. Ensure system dependencies are present
       - name: Setup Deployment Environment
         run: |
           set -e
 
-          echo "Node.js version:"
-          node -v
-
-          echo "NPM version:"
-          npm -v
+          echo "Node.js: $(node -v)"
+          echo "NPM:     $(npm -v)"
 
           if ! command -v pm2 >/dev/null 2>&1; then
             echo "Installing PM2..."
             sudo npm install -g pm2
           fi
 
-          echo "PM2 version:"
-          pm2 -v
+          echo "PM2: $(pm2 -v)"
 
-          sudo apt-get update
-          sudo apt-get install -y rsync curl
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git curl
 
-      # 4. Prepare application directory
-      - name: Prepare Application Directory
+      # 3. Stop and remove the existing PM2 process
+      - name: Stop Existing Application
+        run: |
+          if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
+            echo "Stopping $APP_NAME..."
+            pm2 stop  "$APP_NAME" || true
+            pm2 delete "$APP_NAME" || true
+          else
+            echo "No existing PM2 process found — skipping."
+          fi
+
+      # 4. Delete the previous application folder
+      - name: Delete Previous Application Directory
         run: |
           set -e
+
+          if [ -d "$APP_DIR" ]; then
+            echo "Removing $APP_DIR..."
+            sudo rm -rf "$APP_DIR"
+          fi
 
           sudo mkdir -p "$APP_DIR"
           sudo chown -R "$(whoami):$(whoami)" "$APP_DIR"
 
-      # 5. Copy application files
-      - name: Deploy Application Files
+          echo "Fresh directory ready: $APP_DIR"
+
+      # 5. Clone the repository at the commit that triggered this run
+      - name: Clone Repository
         run: |
           set -e
 
-          rsync -av --delete \
-            --exclude='.git' \
-            --exclude='node_modules' \
-            --exclude='.next' \
-            --exclude='.env' \
-            --exclude='.env.local' \
-            "$GITHUB_WORKSPACE/" "$APP_DIR/"
+          echo "Cloning $REPO_URL at ${{ github.sha }}..."
 
-      # 6. Configure environment variables
+          git clone "$REPO_URL" "$APP_DIR"
+
+          cd "$APP_DIR"
+          git checkout "${{ github.sha }}"
+
+          echo "Cloned successfully."
+
+      # 6. Write environment variables
       - name: Configure Environment
         env:
           SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
@@ -101,53 +111,41 @@ jobs:
 
           chmod 600 .env.production
 
+          echo ".env.production written."
+
       # 7. Install dependencies
+      # @tailwindcss/postcss and tailwindcss are in dependencies (not devDependencies)
+      # so npm ci alone is enough. --include=dev is kept as a safety net.
       - name: Install Dependencies
         run: |
           set -e
 
           cd "$APP_DIR"
 
-          # @tailwindcss/postcss and tailwindcss are in dependencies (not devDependencies)
-          # so a plain npm ci is sufficient. --include=dev kept as a safety net for
-          # any other build-time packages that may be added later.
           npm ci --include=dev
 
           echo "Verifying critical build dependencies..."
-
           npm ls @tailwindcss/postcss tailwindcss
 
-          echo "Dependencies installed successfully."
+          echo "Dependencies installed."
 
-      # 8. Build application
+      # 8. Build the application
       - name: Build Next.js Application
         run: |
           set -e
 
           cd "$APP_DIR"
 
-          export NODE_ENV=production
+          NODE_ENV=production npm run build
 
-          npm run build
-
-          if [ ! -d ".next" ]; then
-            echo "Production build directory missing!"
+          if [ ! -d "$APP_DIR/.next" ]; then
+            echo "ERROR: .next directory not found after build!"
             exit 1
           fi
 
-          echo "Next.js build completed successfully."
+          echo "Build succeeded."
 
-      # 9. Stop previous PM2 process
-      - name: Stop Existing Application
-        run: |
-          if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
-            echo "Stopping existing application..."
-            pm2 delete "$APP_NAME"
-          else
-            echo "No existing application found."
-          fi
-
-      # 10. Start application
+      # 9. Start the application with PM2 on port 3000
       - name: Start Application with PM2
         run: |
           set -e
@@ -155,79 +153,59 @@ jobs:
           cd "$APP_DIR"
 
           NODE_ENV=production pm2 start npm \
-            --name "$APP_NAME" \
-            --cwd "$APP_DIR" \
-            --time \
-            -- start -- -H 127.0.0.1 -p "$PORT"
+            --name  "$APP_NAME" \
+            --cwd   "$APP_DIR" \
+            --time  \
+            -- start -- -p "$PORT"
 
-          echo "Application started."
+          pm2 save
 
-      # 11. Health check
+          echo "Application started on port $PORT."
+
+      # 10. Health check — wait up to 60 s for the server to respond
       - name: Application Health Check
         run: |
           set -e
 
-          echo "Waiting for Next.js server..."
+          echo "Waiting for Next.js to become ready..."
 
-          for i in {1..30}; do
-
-            if curl -fsS \
-              "http://127.0.0.1:$PORT" \
-              -o /dev/null; then
-
-              echo "Application is healthy!"
-
-              pm2 save
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:$PORT" -o /dev/null; then
+              echo "Health check passed on attempt $i."
               pm2 status
-
               exit 0
             fi
-
-            echo "Waiting... Attempt $i/30"
+            echo "  Attempt $i/30 — retrying in 2 s..."
             sleep 2
-
           done
 
-          echo "Application health check failed!"
-
-          pm2 describe "$APP_NAME" || true
-
-          pm2 logs "$APP_NAME" \
-            --lines 100 \
-            --nostream || true
-
+          echo "ERROR: Application did not respond after 60 s."
+          pm2 logs "$APP_NAME" --lines 100 --nostream || true
           exit 1
 
-      # 12. Deployment summary
+      # 11. Deployment summary
       - name: Deployment Summary
         if: success()
         run: |
           echo "======================================"
           echo "       DEPLOYMENT SUCCESSFUL"
           echo "======================================"
-
           echo "Application : $APP_NAME"
           echo "Directory   : $APP_DIR"
           echo "Port        : $PORT"
+          echo "Commit      : ${{ github.sha }}"
           echo "Node.js     : $(node -v)"
           echo "PM2         : $(pm2 -v)"
-
           echo "======================================"
-
           pm2 list
 
-      # 13. Failure diagnostics
+      # 12. Failure diagnostics
       - name: Deployment Failure Diagnostics
         if: failure()
         run: |
           echo "======================================"
           echo "       DEPLOYMENT FAILED"
           echo "======================================"
-
           pm2 status || true
-
-          pm2 logs "$APP_NAME" \
-            --lines 100 \
-            --nostream || true
-
+          pm2 logs "$APP_NAME" --lines 100 --nostream || true
           echo "======================================"
