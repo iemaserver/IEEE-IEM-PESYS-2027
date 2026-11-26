@@ -8,6 +8,10 @@ on:
 
   workflow_dispatch:
 
+concurrency:
+  group: nextjs-production-deployment
+  cancel-in-progress: false
+
 jobs:
   deploy:
     name: Deploy on Self-Hosted Runner
@@ -21,8 +25,10 @@ jobs:
       APP_DIR: /var/www/my-nextjs-app
       APP_NAME: next-app
       PORT: 3000
+      NODE_ENV: production
 
     steps:
+
       # 1. Checkout repository
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -32,82 +38,164 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
 
-      # 3. Ensure npm and PM2 are available
-      - name: Install Dependencies
+      # 3. Verify Node.js and install PM2
+      - name: Setup Deployment Environment
         run: |
           set -e
 
-          if ! command -v node >/dev/null 2>&1; then
-            echo "Node.js is missing"
-            exit 1
-          fi
-
-          if ! command -v npm >/dev/null 2>&1; then
-            echo "npm is missing"
-            exit 1
-          fi
+          echo "Checking Node.js..."
+          node -v
+          npm -v
 
           if ! command -v pm2 >/dev/null 2>&1; then
+            echo "Installing PM2..."
             sudo npm install -g pm2
           fi
 
-          echo "Node: $(node -v)"
-          echo "NPM: $(npm -v)"
-          echo "PM2: $(pm2 -v)"
+          echo "PM2 version:"
+          pm2 -v
 
-      # 4. Prepare deployment directory
+          echo "Environment ready."
+
+      # 4. Prepare application directory
       - name: Prepare Application Directory
         run: |
+          set -e
+
           sudo mkdir -p "$APP_DIR"
           sudo chown -R "$(whoami):$(whoami)" "$APP_DIR"
 
       # 5. Copy application files
-      - name: Copy Application
+      - name: Deploy Application Files
         run: |
+          set -e
+
           rsync -av --delete \
             --exclude='.git' \
             --exclude='node_modules' \
             --exclude='.next' \
+            --exclude='.env' \
+            --exclude='.env.local' \
             "$GITHUB_WORKSPACE/" "$APP_DIR/"
 
-      # 6. Create environment file
-      - name: Configure Environment Variables
+          cd "$APP_DIR"
+
+      # 6. Configure environment variables
+      - name: Configure Environment
+        env:
+          SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
         run: |
+          set -e
+
           cd "$APP_DIR"
 
           cat > .env.production <<EOF
-          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
-          NEXT_PUBLIC_SUPABASE_URL=${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NODE_ENV=production
+          PORT=$PORT
+          NEXT_PUBLIC_SUPABASE_URL=$SUPABASE_URL
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=$SUPABASE_KEY
           EOF
 
-      # 7. Install application dependencies
-      - name: Install Application Dependencies
+          chmod 600 .env.production
+
+      # 7. Install dependencies
+      - name: Install Dependencies
         run: |
+          set -e
+
           cd "$APP_DIR"
+
           npm ci
 
-      # 8. Build application
+      # 8. Build Next.js application
       - name: Build Application
         run: |
+          set -e
+
           cd "$APP_DIR"
+
           npm run build
 
-      # 9. Restart application using PM2
-      - name: Deploy with PM2
-        run: |
-          cd "$APP_DIR"
+          if [ ! -d ".next" ]; then
+            echo "Next.js production build not found!"
+            exit 1
+          fi
 
-          pm2 delete "$APP_NAME" || true
+          echo "Build completed successfully."
+
+      # 9. Stop existing PM2 process
+      - name: Stop Existing Application
+        run: |
+          if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
+            pm2 delete "$APP_NAME"
+          else
+            echo "No existing PM2 process. Fresh deployment."
+          fi
+
+      # 10. Start application with PM2
+      - name: Start Application
+        run: |
+          set -e
+
+          cd "$APP_DIR"
 
           pm2 start npm \
             --name "$APP_NAME" \
-            -- start -- -p "$PORT"
+            --cwd "$APP_DIR" \
+            --time \
+            -- start -- -H 127.0.0.1 -p "$PORT"
 
-          pm2 save
+          echo "Application started through PM2."
 
-      # 10. Verify deployment
-      - name: Verify Deployment
+      # 11. Health check
+      - name: Application Health Check
         run: |
+          set -e
+
+          echo "Waiting for application to start..."
+
+          for i in {1..30}; do
+
+            if curl -fsS \
+              "http://127.0.0.1:$PORT" \
+              -o /dev/null; then
+
+              echo "Application is responding successfully!"
+              pm2 save
+              pm2 status
+              exit 0
+
+            fi
+
+            echo "Attempt $i/30: Application not ready yet."
+            sleep 2
+
+          done
+
+          echo "Application health check failed!"
+
+          pm2 describe "$APP_NAME" || true
+
+          pm2 logs "$APP_NAME" \
+            --lines 100 \
+            --nostream || true
+
+          exit 1
+
+      # 12. Final deployment status
+      - name: Deployment Summary
+        if: success()
+        run: |
+          echo "================================"
+          echo "DEPLOYMENT SUCCESSFUL"
+          echo "================================"
+          echo "Application: $APP_NAME"
+          echo "Directory: $APP_DIR"
+          echo "Port: $PORT"
+          echo "URL: http://127.0.0.1:$PORT"
+          echo "================================"
+
           pm2 list
-          pm2 describe "$APP_NAME"
