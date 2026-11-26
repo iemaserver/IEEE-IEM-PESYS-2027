@@ -1,82 +1,113 @@
 
-name: Deploy Next.js
+name: Deploy Next.js Application
 
 on:
   push:
     branches:
       - main
-  workflow_dispatch:
 
-permissions:
-  contents: read
+  workflow_dispatch:
 
 jobs:
   deploy:
+    name: Deploy on Self-Hosted Runner
     runs-on: self-hosted
 
+    defaults:
+      run:
+        shell: bash
+
     env:
-      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
-      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+      APP_DIR: /var/www/my-nextjs-app
+      APP_NAME: next-app
+      PORT: 3000
 
     steps:
-      # 1. Setup Node.js
-      - name: Setup Node.js and npm
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      # 2. Install PM2 if missing
-      - name: Install PM2 if Missing
-        run: |
-          if ! command -v pm2 >/dev/null 2>&1; then
-            echo "Installing PM2..."
-            npm install -g pm2
-          else
-            echo "PM2 is already installed"
-          fi
-
-      # 3. Stop existing application
-      - name: Stop Existing Application
-        run: |
-          pm2 delete next-app || true
-
-      # 4. Clean deployment directory
-      - name: Clean Deployment Directory
-        run: |
-          sudo rm -rf /var/www/my-nextjs-app
-          sudo mkdir -p /var/www/my-nextjs-app
-          sudo chown "$USER":"$(id -gn)" /var/www/my-nextjs-app
-
-      # 5. Checkout repository
-      - name: Checkout Code
+      # 1. Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 6. Copy application files
+      # 2. Setup Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # 3. Ensure npm and PM2 are available
+      - name: Install Dependencies
+        run: |
+          set -e
+
+          if ! command -v node >/dev/null 2>&1; then
+            echo "Node.js is missing"
+            exit 1
+          fi
+
+          if ! command -v npm >/dev/null 2>&1; then
+            echo "npm is missing"
+            exit 1
+          fi
+
+          if ! command -v pm2 >/dev/null 2>&1; then
+            sudo npm install -g pm2
+          fi
+
+          echo "Node: $(node -v)"
+          echo "NPM: $(npm -v)"
+          echo "PM2: $(pm2 -v)"
+
+      # 4. Prepare deployment directory
+      - name: Prepare Application Directory
+        run: |
+          sudo mkdir -p "$APP_DIR"
+          sudo chown -R "$(whoami):$(whoami)" "$APP_DIR"
+
+      # 5. Copy application files
       - name: Copy Application
         run: |
-          cp -a "$GITHUB_WORKSPACE/." /var/www/my-nextjs-app/
+          rsync -av --delete \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='.next' \
+            "$GITHUB_WORKSPACE/" "$APP_DIR/"
 
-      # 7. Install dependencies
-      - name: Install Dependencies
-        working-directory: /var/www/my-nextjs-app
-        run: npm ci
-
-      # 8. Build Next.js application
-      - name: Build Next.js
-        working-directory: /var/www/my-nextjs-app
-        run: npm run build
-
-      # 9. Start application using PM2
-      - name: Start Next.js Application
-        working-directory: /var/www/my-nextjs-app
+      # 6. Create environment file
+      - name: Configure Environment Variables
         run: |
-          pm2 start npm --name next-app -- start -- -p 3000
+          cd "$APP_DIR"
+
+          cat > .env.production <<EOF
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=${{ secrets.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
+          NEXT_PUBLIC_SUPABASE_URL=${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          EOF
+
+      # 7. Install application dependencies
+      - name: Install Application Dependencies
+        run: |
+          cd "$APP_DIR"
+          npm ci
+
+      # 8. Build application
+      - name: Build Application
+        run: |
+          cd "$APP_DIR"
+          npm run build
+
+      # 9. Restart application using PM2
+      - name: Deploy with PM2
+        run: |
+          cd "$APP_DIR"
+
+          pm2 delete "$APP_NAME" || true
+
+          pm2 start npm \
+            --name "$APP_NAME" \
+            -- start -- -p "$PORT"
+
           pm2 save
 
-      # 10. Deployment status
-      - name: Deployment Status
+      # 10. Verify deployment
+      - name: Verify Deployment
         run: |
-          pm2 status
-          node --version
-          npm --version
-          pm2 --version
+          pm2 list
+          pm2 describe "$APP_NAME"
