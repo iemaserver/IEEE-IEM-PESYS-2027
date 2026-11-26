@@ -25,7 +25,6 @@ jobs:
       APP_DIR: /var/www/my-nextjs-app
       APP_NAME: next-app
       PORT: 3000
-      NODE_ENV: production
 
     steps:
 
@@ -40,13 +39,15 @@ jobs:
           node-version: '22'
           cache: npm
 
-      # 3. Verify Node.js and install PM2
+      # 3. Setup deployment environment
       - name: Setup Deployment Environment
         run: |
           set -e
 
-          echo "Checking Node.js..."
+          echo "Node.js version:"
           node -v
+
+          echo "NPM version:"
           npm -v
 
           if ! command -v pm2 >/dev/null 2>&1; then
@@ -57,7 +58,8 @@ jobs:
           echo "PM2 version:"
           pm2 -v
 
-          echo "Environment ready."
+          sudo apt-get update
+          sudo apt-get install -y rsync curl
 
       # 4. Prepare application directory
       - name: Prepare Application Directory
@@ -80,8 +82,6 @@ jobs:
             --exclude='.env.local' \
             "$GITHUB_WORKSPACE/" "$APP_DIR/"
 
-          cd "$APP_DIR"
-
       # 6. Configure environment variables
       - name: Configure Environment
         env:
@@ -92,9 +92,9 @@ jobs:
 
           cd "$APP_DIR"
 
+          umask 077
+
           cat > .env.production <<EOF
-          NODE_ENV=production
-          PORT=$PORT
           NEXT_PUBLIC_SUPABASE_URL=$SUPABASE_URL
           NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=$SUPABASE_KEY
           EOF
@@ -108,54 +108,63 @@ jobs:
 
           cd "$APP_DIR"
 
-          npm ci
+          npm ci --include=dev
 
-      # 8. Build Next.js application
-      - name: Build Application
+          echo "Checking Tailwind PostCSS dependency..."
+
+          npm ls @tailwindcss/postcss
+
+          echo "Dependencies installed successfully."
+
+      # 8. Build application
+      - name: Build Next.js Application
         run: |
           set -e
 
           cd "$APP_DIR"
+
+          export NODE_ENV=production
 
           npm run build
 
           if [ ! -d ".next" ]; then
-            echo "Next.js production build not found!"
+            echo "Production build directory missing!"
             exit 1
           fi
 
-          echo "Build completed successfully."
+          echo "Next.js build completed successfully."
 
-      # 9. Stop existing PM2 process
+      # 9. Stop previous PM2 process
       - name: Stop Existing Application
         run: |
           if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
+            echo "Stopping existing application..."
             pm2 delete "$APP_NAME"
           else
-            echo "No existing PM2 process. Fresh deployment."
+            echo "No existing application found."
           fi
 
-      # 10. Start application with PM2
-      - name: Start Application
+      # 10. Start application
+      - name: Start Application with PM2
         run: |
           set -e
 
           cd "$APP_DIR"
 
-          pm2 start npm \
+          NODE_ENV=production pm2 start npm \
             --name "$APP_NAME" \
             --cwd "$APP_DIR" \
             --time \
             -- start -- -H 127.0.0.1 -p "$PORT"
 
-          echo "Application started through PM2."
+          echo "Application started."
 
       # 11. Health check
       - name: Application Health Check
         run: |
           set -e
 
-          echo "Waiting for application to start..."
+          echo "Waiting for Next.js server..."
 
           for i in {1..30}; do
 
@@ -163,14 +172,15 @@ jobs:
               "http://127.0.0.1:$PORT" \
               -o /dev/null; then
 
-              echo "Application is responding successfully!"
+              echo "Application is healthy!"
+
               pm2 save
               pm2 status
-              exit 0
 
+              exit 0
             fi
 
-            echo "Attempt $i/30: Application not ready yet."
+            echo "Waiting... Attempt $i/30"
             sleep 2
 
           done
@@ -185,17 +195,36 @@ jobs:
 
           exit 1
 
-      # 12. Final deployment status
+      # 12. Deployment summary
       - name: Deployment Summary
         if: success()
         run: |
-          echo "================================"
-          echo "DEPLOYMENT SUCCESSFUL"
-          echo "================================"
-          echo "Application: $APP_NAME"
-          echo "Directory: $APP_DIR"
-          echo "Port: $PORT"
-          echo "URL: http://127.0.0.1:$PORT"
-          echo "================================"
+          echo "======================================"
+          echo "       DEPLOYMENT SUCCESSFUL"
+          echo "======================================"
+
+          echo "Application : $APP_NAME"
+          echo "Directory   : $APP_DIR"
+          echo "Port        : $PORT"
+          echo "Node.js     : $(node -v)"
+          echo "PM2         : $(pm2 -v)"
+
+          echo "======================================"
 
           pm2 list
+
+      # 13. Failure diagnostics
+      - name: Deployment Failure Diagnostics
+        if: failure()
+        run: |
+          echo "======================================"
+          echo "       DEPLOYMENT FAILED"
+          echo "======================================"
+
+          pm2 status || true
+
+          pm2 logs "$APP_NAME" \
+            --lines 100 \
+            --nostream || true
+
+          echo "======================================"
