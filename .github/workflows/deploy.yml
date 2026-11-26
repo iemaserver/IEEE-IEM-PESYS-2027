@@ -108,11 +108,14 @@ jobs:
 
           cd "$APP_DIR"
 
+          # @tailwindcss/postcss and tailwindcss are in dependencies (not devDependencies)
+          # so a plain npm ci is sufficient. --include=dev kept as a safety net for
+          # any other build-time packages that may be added later.
           npm ci --include=dev
 
-          echo "Checking Tailwind PostCSS dependency..."
+          echo "Verifying critical build dependencies..."
 
-          npm ls @tailwindcss/postcss
+          npm ls @tailwindcss/postcss tailwindcss
 
           echo "Dependencies installed successfully."
 
