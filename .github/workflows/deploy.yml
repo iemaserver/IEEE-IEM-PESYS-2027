@@ -1,3 +1,4 @@
+
 name: Deploy Next.js Application
 
 on:
@@ -24,75 +25,97 @@ jobs:
       APP_DIR: /var/www/my-nextjs-app
       APP_NAME: next-app
       PORT: 3000
+      PM2_HOME: /home/ubuntu/.pm2
       REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
 
     steps:
 
-      # 1. Setup Node.js on the runner
+      # 1. Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
 
-      # 2. Ensure system dependencies are present
+      # 2. Setup deployment environment
       - name: Setup Deployment Environment
         run: |
           set -e
 
+          echo "Current user: $(whoami)"
           echo "Node.js: $(node -v)"
-          echo "NPM:     $(npm -v)"
+          echo "NPM: $(npm -v)"
+
+          if [ "$(whoami)" != "ubuntu" ]; then
+            echo "ERROR: Runner must execute as ubuntu user."
+            exit 1
+          fi
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git curl
 
           if ! command -v pm2 >/dev/null 2>&1; then
             echo "Installing PM2..."
             sudo npm install -g pm2
           fi
 
-          echo "PM2: $(pm2 -v)"
+          echo "PM2 version:"
+          pm2 -v
 
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq git curl
+          mkdir -p "$PM2_HOME"
+          chmod 700 "$PM2_HOME"
 
-      # 3. Stop and remove the existing PM2 process
+      # 3. Stop and remove the old PM2 application
       - name: Stop Existing Application
-        run: |
-          if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
-            echo "Stopping $APP_NAME..."
-            pm2 stop  "$APP_NAME" || true
-            pm2 delete "$APP_NAME" || true
-          else
-            echo "No existing PM2 process found — skipping."
-          fi
-
-      # 4. Delete the previous application folder
-      - name: Delete Previous Application Directory
         run: |
           set -e
 
+          echo "Checking PM2 application: $APP_NAME"
+
+          if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
+            echo "Stopping application..."
+            pm2 stop "$APP_NAME" || true
+
+            echo "Deleting old PM2 process..."
+            pm2 delete "$APP_NAME" || true
+          else
+            echo "No existing application found."
+          fi
+
+          pm2 save
+
+      # 4. Remove the old application and build
+      - name: Delete Previous Build
+        run: |
+          set -e
+
+          echo "Removing previous application directory..."
+
           if [ -d "$APP_DIR" ]; then
-            echo "Removing $APP_DIR..."
             sudo rm -rf "$APP_DIR"
           fi
 
           sudo mkdir -p "$APP_DIR"
-          sudo chown -R "$(whoami):$(whoami)" "$APP_DIR"
+          sudo chown -R ubuntu:ubuntu "$APP_DIR"
 
-          echo "Fresh directory ready: $APP_DIR"
+          echo "Previous build and application directory removed."
 
-      # 5. Clone the repository at the commit that triggered this run
+      # 5. Clone the latest repository
       - name: Clone Repository
         run: |
           set -e
 
-          echo "Cloning $REPO_URL at ${{ github.sha }}..."
+          echo "Cloning repository..."
 
           git clone "$REPO_URL" "$APP_DIR"
 
           cd "$APP_DIR"
+
           git checkout "${{ github.sha }}"
 
-          echo "Cloned successfully."
+          echo "Repository cloned successfully."
+          echo "Commit: $(git rev-parse HEAD)"
 
-      # 6. Write environment variables
+      # 6. Configure production environment
       - name: Configure Environment
         env:
           SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
@@ -111,11 +134,9 @@ jobs:
 
           chmod 600 .env.production
 
-          echo ".env.production written."
+          echo "Production environment configured."
 
       # 7. Install dependencies
-      # @tailwindcss/postcss and tailwindcss are in dependencies (not devDependencies)
-      # so npm ci alone is enough. --include=dev is kept as a safety net.
       - name: Install Dependencies
         run: |
           set -e
@@ -124,88 +145,124 @@ jobs:
 
           npm ci --include=dev
 
-          echo "Verifying critical build dependencies..."
+          echo "Checking Tailwind dependencies..."
+
           npm ls @tailwindcss/postcss tailwindcss
 
-          echo "Dependencies installed."
+          echo "Dependencies installed successfully."
 
-      # 8. Build the application
+      # 8. Build Next.js
       - name: Build Next.js Application
         run: |
           set -e
 
           cd "$APP_DIR"
 
+          echo "Building Next.js application..."
+
+          rm -rf .next
+
           NODE_ENV=production npm run build
 
-          if [ ! -d "$APP_DIR/.next" ]; then
-            echo "ERROR: .next directory not found after build!"
+          if [ ! -d ".next" ]; then
+            echo "ERROR: Next.js build directory missing."
             exit 1
           fi
 
-          echo "Build succeeded."
+          echo "Build completed successfully."
 
-      # 9. Start the application with PM2 on port 3000
+      # 9. Start application with PM2
       - name: Start Application with PM2
         run: |
           set -e
 
           cd "$APP_DIR"
 
-          NODE_ENV=production pm2 start npm \
-            --name  "$APP_NAME" \
-            --cwd   "$APP_DIR" \
-            --time  \
-            -- start -- -p "$PORT"
+          echo "Starting $APP_NAME on port $PORT..."
+
+          pm2 start ./node_modules/next/dist/bin/next \
+            --name "$APP_NAME" \
+            --cwd "$APP_DIR" \
+            --time \
+            -- start -p "$PORT"
 
           pm2 save
 
-          echo "Application started on port $PORT."
+          echo "PM2 application started."
 
-      # 10. Health check — wait up to 60 s for the server to respond
+      # 10. Configure PM2 automatic startup
+      - name: Configure PM2 Startup
+        run: |
+          set -e
+
+          echo "Configuring PM2 systemd startup..."
+
+          sudo env PATH="$PATH" \
+            pm2 startup systemd \
+            -u ubuntu \
+            --hp /home/ubuntu
+
+          pm2 save
+
+          echo "PM2 startup configured."
+
+      # 11. Health check
       - name: Application Health Check
         run: |
           set -e
 
-          echo "Waiting for Next.js to become ready..."
+          echo "Waiting for application..."
 
           for i in $(seq 1 30); do
             if curl -fsS "http://127.0.0.1:$PORT" -o /dev/null; then
-              echo "Health check passed on attempt $i."
+              echo "Health check passed."
+
               pm2 status
+
               exit 0
             fi
-            echo "  Attempt $i/30 — retrying in 2 s..."
+
+            echo "Attempt $i/30..."
             sleep 2
           done
 
-          echo "ERROR: Application did not respond after 60 s."
+          echo "ERROR: Application failed to start."
+
           pm2 logs "$APP_NAME" --lines 100 --nostream || true
+
           exit 1
 
-      # 11. Deployment summary
+      # 12. Deployment summary
       - name: Deployment Summary
         if: success()
         run: |
           echo "======================================"
           echo "       DEPLOYMENT SUCCESSFUL"
           echo "======================================"
+
           echo "Application : $APP_NAME"
           echo "Directory   : $APP_DIR"
           echo "Port        : $PORT"
           echo "Commit      : ${{ github.sha }}"
           echo "Node.js     : $(node -v)"
           echo "PM2         : $(pm2 -v)"
+
           echo "======================================"
+
           pm2 list
 
-      # 12. Failure diagnostics
+      # 13. Failure diagnostics
       - name: Deployment Failure Diagnostics
         if: failure()
         run: |
           echo "======================================"
           echo "       DEPLOYMENT FAILED"
           echo "======================================"
+
           pm2 status || true
-          pm2 logs "$APP_NAME" --lines 100 --nostream || true
+
+          pm2 logs "$APP_NAME" \
+            --lines 100 \
+            --nostream || true
+
           echo "======================================"
